@@ -1,0 +1,321 @@
+package org.bel.locationService.dto.response;
+
+import java.time.OffsetDateTime;
+
+public interface LatestLocationProjection {
+    String getUserId();
+    String getServiceId();
+    String getUserName();
+    String getNodeId();
+    String getNodeName();
+    Double getLatitude();
+    Double getLongitude();
+    Double getAccuracy();
+    OffsetDateTime getLocationTimestamp();
+    String getDeviceId();
+    String getDeviceName();
+    Integer getUserTypeId();
+    String getUserType();
+    String getSymbol();
+    Integer getRoleId();
+    String getRoleName();
+}
+
+package org.bel.locationService.dto.response;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.OffsetDateTime;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class LatestLocationResponse {
+    private String userId;
+    private String serviceId;
+    private String userName;
+    private String nodeId;
+    private String nodeName;
+    private Double latitude;
+    private Double longitude;
+    private Double accuracy;
+    private OffsetDateTime locationTimestamp;
+    private String deviceId;
+    private String deviceName;
+    private Integer userTypeId;
+    private String userType;
+    private String symbol;
+    private Integer roleId;
+    private String roleName;
+}
+
+package org.bel.locationService.repository;
+
+import org.bel.locationService.dto.response.LatestLocationProjection;
+import org.bel.locationService.entity.UserLocationLatest;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface UserLocationLatestRepository extends JpaRepository<UserLocationLatest, String> {
+
+    @Query(value = """
+        SELECT 
+            ull.user_id AS userId,
+            ull.node_id AS nodeId,
+            n.node_name AS nodeName,
+            ull.latitude AS latitude,
+            ull.longitude AS longitude,
+            ull.accuracy AS accuracy,
+            ull.location_timestamp AS locationTimestamp,
+            u.service_id AS serviceId,
+            u.usr_name AS userName,
+            e.device_id AS deviceId,
+            e.device_name AS deviceName,
+            ut.id AS userTypeId,
+            ut.usr_type AS userType,
+            ut.symbol AS symbol,
+            r.id AS roleId,
+            r.role_name AS roleName
+        FROM tcs_laa.user_location_latest ull
+        INNER JOIN tcs_mdm.mdm_user u ON u.id = CAST(ull.user_id AS INTEGER)
+        LEFT JOIN tcs_mdm.mdm_node n ON n.id = u.mdm_node__id
+        LEFT JOIN tcs_mdm.mdm_ue e ON e.id = u.mdm_ue__id
+        LEFT JOIN tcs_mdm.mdm_user_type ut ON ut.id = u.mdm_user_type__id
+        LEFT JOIN tcs_mdm.mdm_role r ON r.id = u.mdm_role__id
+        WHERE 
+            u.id != :callerUserId
+            AND ull.latitude IS NOT NULL 
+            AND ull.longitude IS NOT NULL
+            AND (
+                -- Rule 1: Group Admin (sort_order = 4) -> Only accepted members in active groups
+                (:sortOrder = 4 AND u.id IN (
+                    SELECT gd.mdm_user__id 
+                    FROM tcs_laa.laa_group_tracking_dtl gd
+                    INNER JOIN tcs_laa.laa_group_tracking g ON g.id = gd.laa_group_tracking__id
+                    WHERE g.group_stats = 1 
+                      AND g.mdm_user__id = :callerUserId
+                      AND UPPER(gd.status) = 'ACCEPTED'
+                ))
+                OR
+                -- Rule 2: Restricted Viewers (sort_order > 4) -> Specific user types only
+                (:sortOrder > 4 AND ut.id IN (2, 3, 4, 5))
+                OR
+                -- Rule 3: Top-level Admins (sort_order < 4) -> Unrestricted global view
+                (:sortOrder < 4)
+            )
+        ORDER BY ull.location_timestamp DESC
+    """, nativeQuery = true)
+    List<LatestLocationProjection> findLatestLocations(
+            @Param("callerUserId") Integer callerUserId,
+            @Param("sortOrder") Integer sortOrder
+    );
+}
+
+package org.bel.locationService.service;
+
+import org.bel.locationService.dto.response.LatestLocationResponse;
+import org.bel.locationService.dto.response.SingleResponse;
+
+import java.util.List;
+
+public interface LocationTrackingService {
+    SingleResponse<List<LatestLocationResponse>> getLatestLocation(Integer callerUserId, Integer sortOrder);
+}
+
+package org.bel.locationService.service.impl;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.bel.locationService.dto.response.LatestLocationProjection;
+import org.bel.locationService.dto.response.LatestLocationResponse;
+import org.bel.locationService.dto.response.SingleResponse;
+import org.bel.locationService.enums.CustomStatus;
+import org.bel.locationService.repository.UserLocationLatestRepository;
+import org.bel.locationService.service.LocationTrackingService;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class LocationTrackingServiceImpl implements LocationTrackingService {
+
+    private final UserLocationLatestRepository locationRepository;
+
+    @Override
+    @Transactional(readOnly = true)
+    public SingleResponse<List<LatestLocationResponse>> getLatestLocation(Integer callerUserId, Integer sortOrder) {
+        log.info("[GET_LATEST_LOCATION] Caller UserId: {}, SortOrder: {}", callerUserId, sortOrder);
+
+        // Fallback default sort order to 4 (group level restricted view) if null
+        int effectiveSortOrder = (sortOrder != null) ? sortOrder : 4;
+
+        List<LatestLocationProjection> records = locationRepository.findLatestLocations(callerUserId, effectiveSortOrder);
+
+        List<LatestLocationResponse> responses = records.stream()
+                .map(this::mapToResponse)
+                .collect(Collectors.toList());
+
+        return new SingleResponse<>(responses, CustomStatus.SUCCESS, "Latest location fetched successfully");
+    }
+
+    private LatestLocationResponse mapToResponse(LatestLocationProjection p) {
+        return LatestLocationResponse.builder()
+                .userId(p.getUserId())
+                .serviceId(p.getServiceId())
+                .userName(p.getUserName())
+                .nodeId(p.getNodeId())
+                .nodeName(p.getNodeName())
+                .latitude(p.getLatitude())
+                .longitude(p.getLongitude())
+                .accuracy(p.getAccuracy())
+                .locationTimestamp(p.getLocationTimestamp())
+                .deviceId(p.getDeviceId())
+                .deviceName(p.getDeviceName())
+                .userTypeId(p.getUserTypeId())
+                .userType(p.getUserType())
+                .symbol(p.getSymbol())
+                .roleId(p.getRoleId())
+                .roleName(p.getRoleName())
+                .build();
+    }
+}
+
+package org.bel.locationService.controller;
+
+import lombok.RequiredArgsConstructor;
+import org.bel.locationService.dto.response.LatestLocationResponse;
+import org.bel.locationService.dto.response.SingleResponse;
+import org.bel.locationService.service.LocationTrackingService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/location")
+@RequiredArgsConstructor
+public class LocationTrackingController {
+
+    private final LocationTrackingService locationTrackingService;
+
+    @GetMapping("/latest")
+    public ResponseEntity<SingleResponse<List<LatestLocationResponse>>> getLatestLocation(
+            @RequestHeader("X-User-Id") Integer callerUserId,
+            @RequestParam(value = "sort_order", required = false, defaultValue = "4") Integer sortOrder
+    ) {
+        SingleResponse<List<LatestLocationResponse>> response = 
+                locationTrackingService.getLatestLocation(callerUserId, sortOrder);
+        
+        return ResponseEntity.ok(response);
+    }
+}
+
+
+===============================================
+
+
+package org.bel.locationService.dto.response;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.OffsetDateTime;
+import java.util.List;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class LatestLocationResponse {
+    private String userId;
+    private String serviceId;
+    private String userName;
+    private String nodeId;
+    private String nodeName;
+    private Double accuracy;
+    private OffsetDateTime locationTimestamp;
+    private String deviceId;
+    private String deviceName;
+    private Integer userTypeId;
+    private String userType;
+    private String symbol;
+    private Integer roleId;
+    private String roleName;
+
+    // The nested GeoJSON object
+    private Geom geom;
+
+    @Data
+    @Builder
+    public static class Geom {
+        private String type;
+        private Crs crs;
+        private List<Double> coordinates;
+    }
+
+    @Data
+    @Builder
+    public static class Crs {
+        private String type;
+        private Properties properties;
+    }
+
+    @Data
+    @Builder
+    public static class Properties {
+        private String name;
+    }
+}
+
+private LatestLocationResponse mapToResponse(LatestLocationProjection p) {
+        
+        // 1. Construct the GeoJSON object if coordinates exist
+        LatestLocationResponse.Geom geomObj = null;
+        if (p.getLatitude() != null && p.getLongitude() != null) {
+            geomObj = LatestLocationResponse.Geom.builder()
+                    .type("Point")
+                    .crs(LatestLocationResponse.Crs.builder()
+                            .type("name")
+                            .properties(LatestLocationResponse.Properties.builder()
+                                    .name("EPSG:4326")
+                                    .build())
+                            .build())
+                    // GeoJSON format mandates [Longitude, Latitude] order
+                    .coordinates(List.of(p.getLongitude(), p.getLatitude()))
+                    .build();
+        }
+
+        // 2. Build and return the full response
+        return LatestLocationResponse.builder()
+                .userId(p.getUserId())
+                .serviceId(p.getServiceId())
+                .userName(p.getUserName())
+                .nodeId(p.getNodeId())
+                .nodeName(p.getNodeName())
+                .accuracy(p.getAccuracy())
+                .locationTimestamp(p.getLocationTimestamp())
+                .deviceId(p.getDeviceId())
+                .deviceName(p.getDeviceName())
+                .userTypeId(p.getUserTypeId())
+                .userType(p.getUserType())
+                .symbol(p.getSymbol())
+                .roleId(p.getRoleId())
+                .roleName(p.getRoleName())
+                .geom(geomObj) // Attach the newly created nested object
+                .build();
+    }
